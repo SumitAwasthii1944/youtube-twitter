@@ -4,6 +4,7 @@ import {User} from "../models/user.model.js"
 import {uploadOnCloudinary} from "../utils/cloudinary.js"
 import {ApiResponse} from "../utils/ApiResponse.js"
 import jwt from "jsonwebtoken"
+import mongoose from "mongoose";
 const generateAccessAndRefreshTokens = (async (userId) => {
           try {
                     const user=await User.findById(userId)
@@ -11,7 +12,7 @@ const generateAccessAndRefreshTokens = (async (userId) => {
                     const refreshToken=user.generateRefreshToken();
                     user.refreshToken=refreshToken;
                     user.accessToken=accessToken;
-                    user.save({validateBeforeSave:false})//we dont need to validate password and username here because we checked it earlier
+                    await user.save({validateBeforeSave:false})//we dont need to validate password and username here because we checked it earlier
 
                     return {accessToken,refreshToken}
           } catch (error) {
@@ -139,11 +140,11 @@ const logoutUser = asyncHandler(async (req,res) => {
           await User.findByIdAndUpdate(
                     req.user._id,
                     {
-                              $set:{
-                                        refreshToken:undefined
+                              $unset:{
+                                        refreshToken:1//this removes the field from document
                               }
                     },
-                    { returnDocument: "after" }
+                    { new:true }
 
           )
 
@@ -197,9 +198,251 @@ const refreshAccessToken= asyncHandler(async (req,res) => {
           }
 })
 
+const changeCurrentPassword =asyncHandler(async (req,res) => {
+          // make sure payload contains both passwords and log for debugging
+          const {oldPassword,newPassword} = req.body || {};
+          // you could remove the console.log in production
+          console.log("changeCurrentPassword payload", { oldPassword, newPassword });
+
+          if (!oldPassword || !newPassword) {
+                    throw new ApiError(400, "oldPassword and newPassword are required");
+          }
+
+          const user = await User.findById(req.user?._id);
+          if (!user) {
+                    throw new ApiError(404, "User not found");
+          }
+
+          const isPasswordCorrect = await user.isPasswordCorrect(oldPassword);
+          if (!isPasswordCorrect) {
+                    // either the value is wrong or it wasn't sent at all
+                    throw new ApiError(400, "Invalid old password");
+          }
+
+          user.password = newPassword;
+          await user.save({validateBeforeSave:false});
+
+          return res.status(200).json(
+                    new ApiResponse(200, {}, "password changed successfully")
+          );
+})
+
+const getCurrentUser= asyncHandler( async (req,res) => {
+          return res
+          .status(200)
+          .json(new ApiResponse(200,{},"password changed successfully"))
+})
+
+const updateAccountDetails = asyncHandler( async (req,res) => {
+          const {fullName, email}=req.body
+          if(!fullName || !email){
+                    throw new ApiError(400,"all fields are required")
+          }
+
+          const user=await User.findByIdAndUpdate(
+                    req.user?._id,
+                    {
+                              $set:{
+                                        fullName,
+                                        email:email
+                              }
+                    },
+                    {new:true}//updtae hone ke baad jo info hoti h wo return hoti h
+          ).select("-password ")
+
+          return res
+          .status(200)
+          .json(new ApiResponse(200,user,"Account details updated successfully"))
+})
+//files ko update krne ke liye alg controller likhna chaiye(mtlb alg function )
+
+const updateUserAvatar = asyncHandler(async (req,res) => {
+          const avatarLocalPath=req.file?.path
+
+          if(!avatarLocalPath){
+                    throw new ApiError(400,"Avatar file is missing")
+          }
+          const avatar=await uploadOnCloudinary(avatarLocalPath)
+
+          if(!avatar.url){
+                    throw new ApiError(400,"Error while uploading on avatar")
+          }
+          //delete old avatar after changing the avatar
+          const user=await User.findByIdAndUpdate(
+                    req.user?._id,
+                    {
+                          $set:{
+                              avatar:avatar.url
+                          }    
+                    },
+                    {new:true}
+          ).select("-password")
+          return res
+          .status(200)
+          .json(
+                    new ApiResponse(200,user,"Avatar updated successfully")
+          )
+})
+const updateUserCoverImage = asyncHandler(async () => {
+          const coverImageLocalPath=req.file?.path
+
+          if(!coverImageLocalPath){
+                    throw new ApiError(400,"cover Image file is missing")
+          }
+          const coverImage=await uploadOnCloudinary(coverImageLocalPath)
+
+          if(!coverImage.url){
+                    throw new ApiError(400,"Error while uploading on coverImage")
+          }
+
+          const user=await User.findByIdAndUpdate(
+                    req.user?._id,
+                    {
+                          $set:{
+                              coverImage:coverImage.url
+                          }    
+                    },
+                    {new:true}
+          ).select("-password")
+          return res
+          .status(200)
+          .json(
+                    new ApiResponse(200,user,"Cover image updated successfully")
+          )
+})
+
+const getUserChannelProfile= asyncHandler(async (req,res) => {
+    const {username} =req.params
+
+    if(!username?.trim()){
+        throw new ApiError(400,"username is missing")
+    }
+
+    const channel=await User.aggregate([//pipeline likhne ke baad return me arrays aate hain 
+        {//first pipeline
+            $match:{// jo channel ka username url se aaya hai usse match krna h database me jo username field me hai usse
+                username:username?.toLowerCase()
+            }
+        },
+        {//second pipeline
+            $lookup:{
+                from:"subscriptions",//model ka name lowecase me aur plural ho jaata h tbhi Subscription ko aise likha
+                localField:"_id",//channel ka id
+                foreignField:"channel",//channel ko select kiya to saare subscribers mil gye
+                as:"subscribers"
+            }
+        },
+        {//third pipeline
+            $lookup:{
+                from:"subscriptions",//model ka name lowecase me aur plural ho jaata h tbhi "Subscription" ko aise likha
+                localField:"_id",
+                foreignField:"subscriber",//subscriber ko select kiya to hme saare channels mil gye jinhe hmne subscribe kiya hai
+                as:"subscribedTo"
+            }
+        },
+        {
+            $addFields:{
+                subscribersCount:{
+                    $size:"$subscribers"//field ke liye $ use krte hain
+                },
+                channelsSubscribedToCount:{
+                    $size:"$subscribedTo"
+                },
+                isSubscribed:{//to show subscribe button (boolean) 
+                    $cond:{
+                        if:{$in:[new mongoose.Types.ObjectId(req.user?._id),"$subscribers.subscriber"]},//$in ye arrays aur object dono me dekh leta h // ye check krne ke liye ki kya current user subscribers ke subscriber field me hai ya nahi
+                        then:true,
+                        else:false
+                    }
+                }
+            }
+        },
+        {
+            $project:{//saari cheezein nhi dunga , sirf selected cheezein dunga
+                fullName:1,//jin cheezein ko aage pass on krna h uska flag 1 kr do
+                username:1,
+                subscribersCount:1,
+                channelsSubscribedToCount:1,
+                isSubscribed:1,
+                avatar:1,
+                coverImage:1,
+                email:1
+            }
+        }
+    ])
+    if(!channel?.length){
+        throw new ApiError(404,"channel does not exists")
+    }
+    console.log(channel)
+    return res
+    .status(200)
+    .json(
+        new ApiResponse(200,channel[0],"user channel fetched successfully")
+    )
+})
+
+const getWatchHistory=asyncHandler(async (req,res) => {
+    const user=await User.aggregate([
+        {
+            $match:{
+                _id:new mongoose.Types.ObjectId(req.user._id)//aggregation pipelines me mongoose kaam nhi krta h,tbhi hm req.user._id nhi use kr skte 
+            }
+        },
+        {
+            $lookup:{//watch history me video ki details bhi chahiye to video collection se lookup krna padega
+                from:"videos",
+                localField:"watchHistory",
+                foreignField:"_id",
+                as:"watchHistory",
+                pipeline:[//
+                    {
+                        $lookup:{//video ke owner ki details bhi chahiye to user collection se lookup krna padega
+                            from:"users",
+                            localField:"owner",
+                            foreignField:"_id",
+                            as:"owner",
+                            pipeline:[
+                                {
+                                    $project:{//owner ke liye hmne sirf kuch fields select ki hain, baki fields ko exclude kr diya hai
+                                        fullName:1,
+                                        userName:1,
+                                        avatar:1,
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        $addFields:{//seedhe owner object milega usme se owner. krke nikal lenge
+                            owner:{
+                                $first:"$owner"//owner array me se pehla element le lo, kyuki owner ke liye hmne $lookup me pipeline me $project use kiya tha to owner array me ek hi object hoga
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+    ])
+
+    return res.status(200).json(
+        new ApiResponse(
+            200,
+            user[0].watchHistory,
+            "watch history fetched successfully"
+        )
+    )
+})
+
 export {
           registerUser,
           loginUser,
           logoutUser,
-          refreshAccessToken
+          refreshAccessToken,
+          getCurrentUser,
+          getUserChannelProfile,
+          changeCurrentPassword,
+          updateAccountDetails,
+          updateUserAvatar,
+          updateUserCoverImage,
+          getWatchHistory
 }
